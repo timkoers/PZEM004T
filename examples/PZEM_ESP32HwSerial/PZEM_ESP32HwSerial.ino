@@ -5,8 +5,8 @@
    An example on how to use ESP32 hardware serial with PZEM004T
 */
 
-HardwareSerial PzemSerial2(2);     // Use hwserial UART2 at pins IO-16 (RX2) and IO-17 (TX2)
-PZEM004T pzem(&PzemSerial2);
+HardwareSerial Serial2(2);     // Use hwserial UART2 at pins IO-16 (RX2) and IO-17 (TX2)
+PZEM004T pzem(&Serial2);
 IPAddress ip(192,168,1,1);
 
 void setup() {
