@@ -79,6 +79,8 @@ private:
     
     unsigned long updateInterval = PZEM_DEFAULT_READ_TIMEOUT;
     unsigned long lastUpdate = 0;
+
+    uint8_t nextRequest = 0;
 #else
     bool recieve(uint8_t resp, uint8_t *data = 0);
 #endif

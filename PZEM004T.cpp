@@ -36,7 +36,7 @@ xSemaphoreHandle voltageSemaphore, currentSemaphore, powerSemaphore, energySemap
 
 #define PZEM_BAUD_RATE 9600
 
-#define SEND_DELAY 1 //ms
+#define SEMAPHORE_ACQ_TICKS 0
 
 #ifdef PZEM004_SOFTSERIAL
 PZEM004T::PZEM004T(uint8_t receivePin, uint8_t transmitPin)
@@ -57,11 +57,6 @@ static void IRAM_ATTR handleInterrupt(uint8_t c, void *pzemObject)
     if (!xQueueSendFromISR(serialQueue, &c, &xHigherPriorityTaskWoken))
     {
         ESP_LOGE("PZEM", "Failed to push uart IRQ char onto queue");
-    }
-
-    if (xHigherPriorityTaskWoken)
-    {
-        portYIELD_FROM_ISR();
     }
 }
 #endif
@@ -103,8 +98,8 @@ PZEM004T::PZEM004T(HardwareSerial *port)
 
     ESP_LOGD("PZEM", "Created semaphores");
 
-    // First create the queue and then set the interrupt handler
-    serialQueue = xQueueCreate(RESPONSE_SIZE, sizeof(uint8_t));
+    // First create the queue and then set the interrupt handler, store 4 messages in the queue
+    serialQueue = xQueueCreate(RESPONSE_SIZE * 4, sizeof(uint8_t));
     assert(serialQueue != NULL);
     xQueueReset(serialQueue);
 
@@ -114,6 +109,8 @@ PZEM004T::PZEM004T(HardwareSerial *port)
     port->setRXInterrupt(handleInterrupt, (void *)this);
 
     ESP_LOGD("PZEM", "Assigned uart interrupt handler");
+
+    nextRequest = PZEM_VOLTAGE;
 #endif
 
     this->serial = port;
@@ -133,47 +130,59 @@ bool PZEM004T::processQueue()
     bool ok = false;
 
     uint8_t buffer[RESPONSE_SIZE];
+    uint8_t len = 0, c;
+    // ok should be true when entering this loop
+    ok = uxQueueMessagesWaiting(serialQueue) > 0 && !((int)uxQueueMessagesWaiting(serialQueue) % RESPONSE_SIZE);
 
-    // Clear the buffer as items where leaking into the rx buffer
-    memset(buffer, '\0', RESPONSE_SIZE);
-
-    uint8_t len = 0;
-
-    uint8_t c;
-
-    ok = (int)uxQueueMessagesWaiting(serialQueue) == RESPONSE_SIZE;
-
-    // The serial interrupt handler should handle it, we only wait until the queue is full
-    while (ok && len < RESPONSE_SIZE)
+    while ((ok = ((int)uxQueueMessagesWaiting(serialQueue) > 0 && !((int)uxQueueMessagesWaiting(serialQueue) % RESPONSE_SIZE))), ok)
     {
-        // Receive from the queue
-        if (xQueueReceive(serialQueue, &c, 0) != pdTRUE) // Don't block
-            continue;                                    // Skip this iteration, since no valuable data is received
+        // Clear the buffer as items where leaking into the rx buffer
+        memset(buffer, '\0', RESPONSE_SIZE);
 
-        if (!c && !len)
-            continue; // skip 0 at startup
+        len = 0;
+        c = 0;        
 
-        buffer[len++] = c;
+        ESP_LOGD("PZEM", "Processing queue (%d items)", uxQueueMessagesWaiting(serialQueue));
+
+        // The serial interrupt handler should handle it, we only wait until the queue is full
+        while (ok && len < RESPONSE_SIZE)
+        {
+            // Receive from the queue
+            if (xQueueReceive(serialQueue, &c, 0) != pdTRUE) // Don't block
+                continue;                                    // Skip this iteration, since no valuable data is received
+
+            if (!c && !len)
+                continue; // skip 0 at startup
+
+            buffer[len++] = c;
+        }
+
+        if (!ok)
+        {
+            ESP_LOGE("PZEM", "Queue got messed up");
+            // Might reset it
+        }
+
+        if (len > 0)
+        {
+            ok = (len == RESPONSE_SIZE);
+
+            // Convert the buffer into values
+            if (ok)
+            {
+                ok = recieve(buffer);
+
+                if (!ok)
+                    ESP_LOGE("PZEM", "Failed to parse buffer");
+            }
+            else
+            {
+                ESP_LOGE("PZEM", "Failed handling the queue (len %d), resetting..", len);
+                xQueueReset(serialQueue);
+            }
+        }
     }
 
-    if (len > 0)
-    {
-        ok = len == RESPONSE_SIZE;
-
-        // Convert the buffer into values
-        if (ok)
-        {
-            ok = recieve(buffer);
-
-            if (!ok)
-                ESP_LOGE("PZEM", "Failed to parse buffer");
-        }
-        else
-        {
-            ESP_LOGE("PZEM", "Failed handling the queue (len %d), resetting..", len);
-            xQueueReset(serialQueue);
-        }
-    }
     return ok;
 }
 
@@ -185,6 +194,9 @@ void PZEM004T::setUpdateInterval(unsigned long interval)
 // Call as often as possible
 bool PZEM004T::update()
 {
+    // Flush everything
+    this->serial->flush();
+
     // Request everything
     bool ok = processQueue();
 
@@ -198,32 +210,17 @@ bool PZEM004T::update()
             // Don't need the queue semaphore for this
             //xQueueReset(serialQueue);
 
-            // Just send everything, the response is handled by the interrupt handler
-
-            ESP_LOGD("PZEM", "Requesting voltage");
-
-            do{
-                processQueue();
-            }while(!send(mIp, PZEM_VOLTAGE));
+            // Just send everything, the response is handled by the interrupt handler, and put into the queue which can hold 4 answers
             
-            ESP_LOGD("PZEM", "Requesting current");
+            ESP_LOGD("PZEM", "Requesting %02x", nextRequest);
 
-            do{
-                processQueue();
-            }while(!send(mIp, PZEM_CURRENT));
+            send(mIp, nextRequest);
 
-            ESP_LOGD("PZEM", "Requesting power");
-
-            do{
-                processQueue();
-            }while(!send(mIp, PZEM_POWER));
-            
-            ESP_LOGD("PZEM", "Requesting energy");
-
-            do{
-                processQueue();
-            }while(!send(mIp, PZEM_ENERGY));
-            
+            if(nextRequest != PZEM_ENERGY){
+                nextRequest++;
+            }else{
+                nextRequest = PZEM_VOLTAGE;
+            }
         }
     }
 
@@ -241,7 +238,7 @@ bool PZEM004T::voltage(float &output)
 {
     bool ok = false;
 
-    if (ok = (xSemaphoreTake(voltageSemaphore, 100) == pdTRUE), ok)
+    if (ok = (xSemaphoreTake(voltageSemaphore, SEMAPHORE_ACQ_TICKS) == pdTRUE), ok)
     {
         output = mVoltage;
         xSemaphoreGive(voltageSemaphore);
@@ -254,7 +251,7 @@ bool PZEM004T::current(float &output)
 {
     bool ok = false;
 
-    if (ok = (xSemaphoreTake(currentSemaphore, 100) == pdTRUE), ok)
+    if (ok = (xSemaphoreTake(currentSemaphore, SEMAPHORE_ACQ_TICKS) == pdTRUE), ok)
     {
         output = mCurrent;
         xSemaphoreGive(currentSemaphore);
@@ -267,7 +264,7 @@ bool PZEM004T::power(float &output)
 {
     bool ok = false;
 
-    if (ok = (xSemaphoreTake(powerSemaphore, 100) == pdTRUE), ok)
+    if (ok = (xSemaphoreTake(powerSemaphore, SEMAPHORE_ACQ_TICKS) == pdTRUE), ok)
     {
         output = mPower;
         xSemaphoreGive(powerSemaphore);
@@ -280,7 +277,7 @@ bool PZEM004T::energy(float &output)
 {
     bool ok = false;
 
-    if (ok = (xSemaphoreTake(energySemaphore, 100) == pdTRUE), ok)
+    if (ok = (xSemaphoreTake(energySemaphore, SEMAPHORE_ACQ_TICKS) == pdTRUE), ok)
     {
         output = mEnergy;
         xSemaphoreGive(energySemaphore);
@@ -293,12 +290,19 @@ bool PZEM004T::setAddress(const IPAddress &newAddr)
 {
     bool ok = false;
 
-    send(newAddr, PZEM_SET_ADDRESS);
-    if (ok = (xSemaphoreTake(addressSemaphore, 100) == pdTRUE), ok)
-    {        
-        ok = mIp == newAddr;
+    // First check if the address is already the same
+    if (xSemaphoreTake(addressSemaphore, SEMAPHORE_ACQ_TICKS) == pdTRUE)
+    {
+        ESP_LOGD("PZEM", "Got addr. sem");
+        ok = (mIp == newAddr);
         xSemaphoreGive(addressSemaphore);
+
+        if (ok)
+            ESP_LOGD("PZEM", "Matching");
     }
+
+    if (!ok)
+        send(newAddr, PZEM_SET_ADDRESS);
 
     return ok;
 }
@@ -314,7 +318,7 @@ bool PZEM004T::setPowerAlarm(uint8_t threshold)
     send(mIp, PZEM_POWER_ALARM, threshold);
     delay(100); // Hopefully wait for the response
 
-    if (ok = (xSemaphoreTake(powerAlarmSemaphore, 100) == pdTRUE), ok)
+    if (ok = (xSemaphoreTake(powerAlarmSemaphore, SEMAPHORE_ACQ_TICKS) == pdTRUE), ok)
     {
         thres = mPowerAlarm;
         xSemaphoreGive(powerAlarmSemaphore);
@@ -385,9 +389,7 @@ IPAddress mTempIp;
 
 bool PZEM004T::send(const IPAddress &addr, uint8_t cmd, uint8_t data)
 {
-    if (uxQueueMessagesWaiting(serialQueue) != 0)
-        return false;
-
+    //ESP_LOGD("PZEM", "Messages waiting in queue %d", uxQueueMessagesWaiting(serialQueue));
     PZEMCommand pzem;
 
     pzem.command = cmd;
@@ -403,8 +405,6 @@ bool PZEM004T::send(const IPAddress &addr, uint8_t cmd, uint8_t data)
     pzem.crc = crc(bytes, sizeof(pzem) - 1);
 
     serial->write(bytes, sizeof(pzem));
-
-    vTaskDelay(pdMS_TO_TICKS(SEND_DELAY));
 
     return true;
 }
@@ -462,6 +462,7 @@ bool PZEM004T::recieve(uint8_t *data)
     {
         if (ok = (xSemaphoreTake(currentSemaphore, portMAX_DELAY) == pdTRUE), ok)
         {
+            ESP_LOGD("PZEM", "Calculating current float");
             mCurrent = (float)((data[0] << 8) + data[1] + (data[2] / 100.0));
             xSemaphoreGive(currentSemaphore);
         }
@@ -472,6 +473,7 @@ bool PZEM004T::recieve(uint8_t *data)
     {
         if (ok = (xSemaphoreTake(energySemaphore, portMAX_DELAY) == pdTRUE), ok)
         {
+            ESP_LOGD("PZEM", "Calculating energy float");
             mEnergy = (float)((uint32_t)(data[0] << 16) + ((uint16_t)(data[1]) << 8) + data[2]);
             xSemaphoreGive(energySemaphore);
         }
@@ -482,6 +484,7 @@ bool PZEM004T::recieve(uint8_t *data)
     {
         if (ok = (xSemaphoreTake(powerSemaphore, portMAX_DELAY) == pdTRUE), ok)
         {
+            ESP_LOGD("PZEM", "Calculating power float");
             mPower = (float)((data[0] << 8) + data[1]);
             xSemaphoreGive(powerSemaphore);
         }
