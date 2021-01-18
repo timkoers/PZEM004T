@@ -1,5 +1,7 @@
 #include "PZEM004T.h"
 
+#define LOG_TAG "PZEM004-T"
+
 #if defined(ESP32)
 #include <esp_task_wdt.h>
 #endif
@@ -10,6 +12,8 @@
 
 // Mutexes
 xSemaphoreHandle voltageSemaphore, currentSemaphore, powerSemaphore, energySemaphore, addressSemaphore, powerAlarmSemaphore = NULL;
+
+portMUX_TYPE processingMux = portMUX_INITIALIZER_UNLOCKED;
 
 // http://wiki.bernardino.org/index.php/Electric_monitoring_and_communication_module_power_energy_meter
 
@@ -50,13 +54,18 @@ PZEM004T::PZEM004T(uint8_t receivePin, uint8_t transmitPin)
 
 #if (ESP32_INTERRUPT)
 QueueHandle_t serialQueue;
-static void IRAM_ATTR handleInterrupt(uint8_t c, void *pzemObject)
+static void IRAM_ATTR handleInterrupt(uint8_t c, void *user_arg)
 {
     BaseType_t xHigherPriorityTaskWoken;
 
     if (!xQueueSendFromISR(serialQueue, &c, &xHigherPriorityTaskWoken))
     {
-        ESP_LOGE("PZEM", "Failed to push uart IRQ char onto queue");
+        ESP_LOGE(LOG_TAG, "Failed to push uart IRQ char onto queue");
+    }
+
+    // This needs to be here, otherwhise weird stuff will happen (interupted tasks will not continue after the IRQ has finished)
+    if(xHigherPriorityTaskWoken){
+        portYIELD_FROM_ISR();
     }
 }
 #endif
@@ -96,19 +105,19 @@ PZEM004T::PZEM004T(HardwareSerial *port)
     xSemaphoreGive(addressSemaphore);
     xSemaphoreGive(powerAlarmSemaphore);
 
-    ESP_LOGD("PZEM", "Created semaphores");
+    ESP_LOGD(LOG_TAG, "Created semaphores");
 
     // First create the queue and then set the interrupt handler, store 4 messages in the queue
     serialQueue = xQueueCreate(RESPONSE_SIZE * 4, sizeof(uint8_t));
     assert(serialQueue != NULL);
     xQueueReset(serialQueue);
 
-    ESP_LOGD("PZEM", "Queue created");
+    ESP_LOGD(LOG_TAG, "Queue created");
 
     // Add the interrupt function again
     port->setRXInterrupt(handleInterrupt, (void *)this);
 
-    ESP_LOGD("PZEM", "Assigned uart interrupt handler");
+    ESP_LOGD(LOG_TAG, "Assigned uart interrupt handler");
 
     nextRequest = PZEM_VOLTAGE;
 #endif
@@ -131,8 +140,9 @@ bool PZEM004T::processQueue()
 
     uint8_t buffer[RESPONSE_SIZE];
     uint8_t len = 0, c;
+
     // ok should be true when entering this loop
-    ok = uxQueueMessagesWaiting(serialQueue) > 0 && !((int)uxQueueMessagesWaiting(serialQueue) % RESPONSE_SIZE);
+    //ok = uxQueueMessagesWaiting(serialQueue) > 0 && !((int)uxQueueMessagesWaiting(serialQueue) % RESPONSE_SIZE);
 
     while ((ok = ((int)uxQueueMessagesWaiting(serialQueue) > 0 && !((int)uxQueueMessagesWaiting(serialQueue) % RESPONSE_SIZE))), ok)
     {
@@ -140,9 +150,7 @@ bool PZEM004T::processQueue()
         memset(buffer, '\0', RESPONSE_SIZE);
 
         len = 0;
-        c = 0;        
-
-        ESP_LOGD("PZEM", "Processing queue (%d items)", uxQueueMessagesWaiting(serialQueue));
+        c = 0;
 
         // The serial interrupt handler should handle it, we only wait until the queue is full
         while (ok && len < RESPONSE_SIZE)
@@ -154,13 +162,11 @@ bool PZEM004T::processQueue()
             if (!c && !len)
                 continue; // skip 0 at startup
 
-            buffer[len++] = c;
-        }
+            portENTER_CRITICAL(&processingMux);
 
-        if (!ok)
-        {
-            ESP_LOGE("PZEM", "Queue got messed up");
-            // Might reset it
+            buffer[len++] = c;
+
+            portEXIT_CRITICAL(&processingMux);
         }
 
         if (len > 0)
@@ -170,14 +176,12 @@ bool PZEM004T::processQueue()
             // Convert the buffer into values
             if (ok)
             {
+                portENTER_CRITICAL(&processingMux);
                 ok = recieve(buffer);
-
-                if (!ok)
-                    ESP_LOGE("PZEM", "Failed to parse buffer");
+                portEXIT_CRITICAL(&processingMux);
             }
             else
             {
-                ESP_LOGE("PZEM", "Failed handling the queue (len %d), resetting..", len);
                 xQueueReset(serialQueue);
             }
         }
@@ -211,14 +215,17 @@ bool PZEM004T::update()
             //xQueueReset(serialQueue);
 
             // Just send everything, the response is handled by the interrupt handler, and put into the queue which can hold 4 answers
-            
-            ESP_LOGD("PZEM", "Requesting %02x", nextRequest);
+
+            ESP_LOGD(LOG_TAG, "Requesting %02x", nextRequest);
 
             send(mIp, nextRequest);
 
-            if(nextRequest != PZEM_ENERGY){
+            if (nextRequest != PZEM_ENERGY)
+            {
                 nextRequest++;
-            }else{
+            }
+            else
+            {
                 nextRequest = PZEM_VOLTAGE;
             }
         }
@@ -293,12 +300,11 @@ bool PZEM004T::setAddress(const IPAddress &newAddr)
     // First check if the address is already the same
     if (xSemaphoreTake(addressSemaphore, SEMAPHORE_ACQ_TICKS) == pdTRUE)
     {
-        ESP_LOGD("PZEM", "Got addr. sem");
         ok = (mIp == newAddr);
         xSemaphoreGive(addressSemaphore);
 
         if (ok)
-            ESP_LOGD("PZEM", "Matching");
+            ESP_LOGV(LOG_TAG, "Addresses are matching");
     }
 
     if (!ok)
@@ -389,7 +395,7 @@ IPAddress mTempIp;
 
 bool PZEM004T::send(const IPAddress &addr, uint8_t cmd, uint8_t data)
 {
-    //ESP_LOGD("PZEM", "Messages waiting in queue %d", uxQueueMessagesWaiting(serialQueue));
+    //ESP_LOGD(LOG_TAG, "Messages waiting in queue %d", uxQueueMessagesWaiting(serialQueue));
     PZEMCommand pzem;
 
     pzem.command = cmd;
@@ -422,11 +428,9 @@ bool PZEM004T::recieve(uint8_t *data)
     // Check the CRC first before loading in the values
     if (!ok)
     {
-        ESP_LOGE("PZEM", "CRC check failed");
+        ESP_LOGE(LOG_TAG, "CRC check failed");
         return false;
     }
-
-    ESP_LOGD("PZEM", "Parsing header %02x", header);
 
     // switch the first byte of the buffer.
     switch (header)
@@ -452,7 +456,6 @@ bool PZEM004T::recieve(uint8_t *data)
     {
         if (ok = (xSemaphoreTake(voltageSemaphore, portMAX_DELAY) == pdTRUE), ok)
         {
-            ESP_LOGD("PZEM", "Calculating voltage float");
             mVoltage = (float)((data[0] << 8) + data[1] + (data[2] / 10.0));
             xSemaphoreGive(voltageSemaphore);
         }
@@ -462,7 +465,6 @@ bool PZEM004T::recieve(uint8_t *data)
     {
         if (ok = (xSemaphoreTake(currentSemaphore, portMAX_DELAY) == pdTRUE), ok)
         {
-            ESP_LOGD("PZEM", "Calculating current float");
             mCurrent = (float)((data[0] << 8) + data[1] + (data[2] / 100.0));
             xSemaphoreGive(currentSemaphore);
         }
@@ -473,7 +475,6 @@ bool PZEM004T::recieve(uint8_t *data)
     {
         if (ok = (xSemaphoreTake(energySemaphore, portMAX_DELAY) == pdTRUE), ok)
         {
-            ESP_LOGD("PZEM", "Calculating energy float");
             mEnergy = (float)((uint32_t)(data[0] << 16) + ((uint16_t)(data[1]) << 8) + data[2]);
             xSemaphoreGive(energySemaphore);
         }
@@ -484,7 +485,6 @@ bool PZEM004T::recieve(uint8_t *data)
     {
         if (ok = (xSemaphoreTake(powerSemaphore, portMAX_DELAY) == pdTRUE), ok)
         {
-            ESP_LOGD("PZEM", "Calculating power float");
             mPower = (float)((data[0] << 8) + data[1]);
             xSemaphoreGive(powerSemaphore);
         }
@@ -510,7 +510,7 @@ bool PZEM004T::recieve(uint8_t *data)
     }
     default:
     {
-        ESP_LOGE("PZEM", "Unkown response header %02x", header);
+        ESP_LOGE(LOG_TAG, "Unkown response header %02x", header);
         break;
     }
     }
@@ -544,27 +544,27 @@ bool PZEM004T::recieve(uint8_t resp, uint8_t *data)
             if (!c && !len)
                 continue; // skip 0 at startup
 
-            ESP_LOGD("PZEM", "Read %02x (%d)", c, len);
+            ESP_LOGD(LOG_TAG, "Read %02x (%d)", c, len);
             buffer[len++] = c;
         }
     }
 
-    ESP_LOGD("PZEM", "len %d, expecting %d", len, RESPONSE_SIZE);
+    ESP_LOGD(LOG_TAG, "len %d, expecting %d", len, RESPONSE_SIZE);
 
     if (len != RESPONSE_SIZE)
         return false;
 
-    ESP_LOGD("PZEM", "Response size matching");
+    ESP_LOGD(LOG_TAG, "Response size matching");
 
     if (buffer[6] != crc(buffer, len - 1))
         return false;
 
-    ESP_LOGD("PZEM", "CRC matching");
+    ESP_LOGD(LOG_TAG, "CRC matching");
 
     if (buffer[0] != resp)
         return false;
 
-    ESP_LOGD("PZEM", "Response matching");
+    ESP_LOGD(LOG_TAG, "Response matching");
 
     if (data)
     {
@@ -572,7 +572,7 @@ bool PZEM004T::recieve(uint8_t resp, uint8_t *data)
             data[i] = buffer[1 + i];
     }
 
-    ESP_LOGD("PZEM", "recieve() will finish succesfully!");
+    ESP_LOGD(LOG_TAG, "recieve() will finish succesfully!");
 
     return true;
 }
